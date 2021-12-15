@@ -30,12 +30,7 @@ is say "DO NOT USE IF YOU HAVE POSTBLITS". Or provide an equally bad escape hatc
 of a @system public incRef.
 
 - RCSlice!T -> RCSlice!(const(T)) <- RCSlice!(immutable(T))
-Implicit conversion from slices of (im)mutable to slices of const looks like could be hacked in via alias this,
-however at the present (2.098) implementing such results in DMD segfaulting (LDC doesn't).
-Search for EnableImplicitConvToConst to find such instances in unit tests.
-The biggest problem is that one of such occurrences is aggregation of an RCSlice into a struct,
-making uses of RCSlice severely limited. So at the moment this conversion is disabled for DMD.
-Haven't tested with GDC.
+Implicit conversion from slices of (im)mutable to slices of const looks like could be hacked in via alias this.
 
 - Some code duplication is taking place.
 
@@ -169,12 +164,6 @@ auto trustedIf(bool condition, Dg)(scope Dg dg)
     .ifSafeThenTrusted(dg);
 }
 
-version (LDC) enum bool EnableImplicitConvToConst = true;
-else
-// Enable this to make implicit copying of RCSlice!T -> RCSlice!(const(T)) work,
-// and uncover compiler bugs :)
-enum bool EnableImplicitConvToConst = false;
-
 struct RCSlice(T)
 {
     /// Creates a slice of size `size` with default-initialized elements,
@@ -197,6 +186,12 @@ struct RCSlice(T)
                 pureGCAddRange(cast(Unqual!T[]) array, typeid(T));
             }
         }
+    }
+
+    this(U, this This)(ref return scope U init, string file = __FILE__, size_t line = __LINE__) scope @trusted
+    if (isMutable!This && __traits(isStaticArray, U) && isCopyable!(T, typeof(U.init[0])))
+    {
+        this(init[], file, line);
     }
 
     /// Creates a slice by copying elements from `init`
@@ -293,7 +288,7 @@ struct RCSlice(T)
     }
 
     // Implicit conversion to RCSlice!(const(T))
-    static if (EnableImplicitConvToConst && !is(T == const))
+    static if (!is(T == const))
     {
         RCSlice!(const(T)) toConst(this This)() @trusted
         {
@@ -322,35 +317,16 @@ struct RCSlice(T)
     void opAssign(U)(auto ref inout RCSlice!U rhs) scope @trusted
     if (is(U* : T*))
     {
-        version (none)
+        auto tmp = this;
+        static if (__traits(isRef, rhs))
         {
-            auto tmp = this;
-            static if (__traits(isRef, rhs))
-            {
-                repr = cast(Repr) rhs.repr;
-                incRef(repr.block);
-            }
-            else
-            {
-                repr = cast(Repr) rhs.repr;
-                cast() rhs.repr = rhs.repr.init;
-            }
+            repr = cast(Repr) rhs.repr;
+            incRef(repr.block);
         }
         else
         {
-            auto r = cast(Repr) rhs.repr;
-            incRef(r.block);
-            auto tmp = typeof(this)(r);
-            static if (__traits(isRef, rhs))
-            {
-                repr = cast(Repr) rhs.repr;
-                incRef(repr.block);
-            }
-            else
-            {
-                repr = cast(Repr) rhs.repr;
-                cast() rhs.repr = rhs.repr.init;
-            }
+            repr = cast(Repr) rhs.repr;
+            cast() rhs.repr = rhs.repr.init;
         }
     }
 
@@ -394,44 +370,73 @@ struct RCSlice(T)
         return repr.data.all() == rhs;
     }
 
-    This opBinary(string op, U, this This)(auto ref return scope RCSlice!U rhs, string file = __FILE__, size_t line = __LINE__)
+    template opBinary(string op)
     if (op == "~")
     {
-        const size_t total = length + rhs.length;
-        if (!total)
-            return This.init;
-        enum bool safeToDestruct = !is(T == struct) || isSafeDestructible!T;
-        enum bool deducedSafety =
+        This opBinary(U, this This)(return scope U[] rhs, string file = __FILE__, size_t line = __LINE__)
         {
-            return isSafeCopyable!T &&
-                   isSafeCopyable!(T, U) &&
-                   ((isNothrowCopyable!T && isNothrowCopyable!(T, U)) ||
-                    safeToDestruct);
-        }();
-        // trustedIf... sigh
-        return trustedIf!deducedSafety({
-            auto result = allocate(allocationSize(total, file, line));
-            static if (!isNothrowCopyable!T || !isNothrowCopyable!(T, U))
+            const size_t total = length + rhs.length;
+            if (!total)
+                return This.init;
+            enum bool safeToDestruct = !is(T == struct) || isSafeDestructible!T;
+            enum bool deducedSafety =
             {
-                version (D_Exceptions) scope (failure)
-                    deallocate(result);
-            }
-            copyEmplaceConcat(result.data.all(), repr.data.all(), rhs.repr.data.all());
-            static if (exposeToGC)
-            {
-                // cast because could be `shared`
-                pureGCAddRange(cast(Unqual!T[]) result.data.all(), typeid(T));
-            }
-            return This(result);
-        });
+                return isSafeCopyable!T &&
+                       isSafeCopyable!(T, U) &&
+                       ((isNothrowCopyable!T && isNothrowCopyable!(T, U)) ||
+                        safeToDestruct);
+            }();
+            // trustedIf... sigh
+            return trustedIf!deducedSafety({
+                auto result = allocate(allocationSize(total, file, line));
+                static if (!isNothrowCopyable!T || !isNothrowCopyable!(T, U))
+                {
+                    version (D_Exceptions) scope (failure)
+                        deallocate(result);
+                }
+                copyEmplaceConcat(result.data.all(), repr.data.all(), rhs);
+                static if (exposeToGC)
+                {
+                    // cast because could be `shared`
+                    pureGCAddRange(cast(Unqual!T[]) result.data.all(), typeid(T));
+                }
+                return This(result);
+            });
+        }
+
+        This opBinary(U, this This)(ref scope U rhs, string file = __FILE__, size_t line = __LINE__) @trusted
+        if (__traits(isStaticArray, U))
+        {
+            return opBinary!(typeof(U.init[0]), This)(rhs[], file, line);
+        }
+
+        This opBinary(U, this This)(auto ref return scope RCSlice!U rhs, string file = __FILE__, size_t line = __LINE__)
+        {
+            return opBinary!(U, This)(rhs.repr.data.all(), file, line);
+        }
     }
 
-    void opOpAssign(string op, U)(auto ref return scope RCSlice!U rhs, string file = __FILE__, size_t line = __LINE__)
+    template opOpAssign(string op)
     if (op == "~")
     {
-        // TODO: use realloc for PODs (only without indirections if exposeToGC)
-        this = this.opBinary!op(rhs, file, line);
+        void opOpAssign(U)(return scope U[] rhs, string file = __FILE__, size_t line = __LINE__)
+        {
+            this = this.opBinary!op(rhs, file, line);
+        }
+
+        void opOpAssign(U)(ref scope U rhs, string file = __FILE__, size_t line = __LINE__) @trusted
+        if (__traits(isStaticArray, U))
+        {
+            this = this.opBinary!op(rhs[], file, line);
+        }
+
+        void opOpAssign(U)(auto ref return scope RCSlice!U rhs, string file = __FILE__, size_t line = __LINE__)
+        {
+            // TODO: use realloc for PODs (only without indirections if exposeToGC)
+            this = this.opBinary!op(rhs, file, line);
+        }
     }
+
 
     /// Returns current number of references.
     size_t refCount() const @trusted
@@ -532,18 +537,8 @@ struct RCSlice(T)
     {
         // Borrow another reference until caller is done with our data,
         // in case `dg` attampts to dangle `this`.
-        static if (false && !EnableImplicitConvToConst)
-        {
-            This tmp = this;
-            return dg(tmp.repr.data.all());
-        }
-        else
-        {
-            This.Repr tmpRepr = this.repr;
-            incRef(tmpRepr.block);
-            This tmp = tmpRepr;
-            return dg(tmpRepr.data.all());
-        }
+        This tmp = this;
+        return dg(tmp.repr.data.all());
     }
 
     void toString(Sink, Spec)(scope Sink sink, scope ref const Spec spec) scope @trusted
@@ -1086,47 +1081,43 @@ do
 }
 
 //@betterC
-version (none)
 @safe @nogc pure nothrow unittest
 {
     static assert(__traits(compiles, { RCSlice!int s = 0; }));
-    static assert(__traits(compiles, { const RCSlice!int s = 0; }));
-    static assert(__traits(compiles, { immutable RCSlice!int s = 0; }));
+    static assert(!__traits(compiles, { const RCSlice!int s = 0; }));
+    static assert(!__traits(compiles, { immutable RCSlice!int s = 0; }));
 
     static assert(__traits(compiles, { RCSlice!(const(int)) s = 0; }));
-    static assert(__traits(compiles, { const RCSlice!(const(int)) s = 0; }));
-    static assert(__traits(compiles, { immutable RCSlice!(const(int)) s = 0; }));
+    static assert(!__traits(compiles, { const RCSlice!(const(int)) s = 0; }));
+    static assert(!__traits(compiles, { immutable RCSlice!(const(int)) s = 0; }));
     static assert(__traits(compiles, { RCSlice!(immutable(int)) s = 0; }));
-    static assert(__traits(compiles, { const RCSlice!(immutable(int)) s = 0; }));
-    static assert(__traits(compiles, { immutable RCSlice!(immutable(int)) s = 0; }));
+    static assert(!__traits(compiles, { const RCSlice!(immutable(int)) s = 0; }));
+    static assert(!__traits(compiles, { immutable RCSlice!(immutable(int)) s = 0; }));
 }
 
 //@betterC
-version(none)
 @safe @nogc pure nothrow unittest
 {
-    const RCSlice!int c;
-    RCSlice!int m = c;
     static assert( isCopyable!(RCSlice!int, const(RCSlice!int)));
     static assert( isCopyable!(RCSlice!int, immutable(RCSlice!int)));
     static assert(!isCopyable!(RCSlice!int, RCSlice!(const(int))));
     static assert(!isCopyable!(RCSlice!int, RCSlice!(immutable(int))));
 
-    static assert( isCopyable!(RCSlice!(const(int)), RCSlice!int));
+    static assert(!isCopyable!(RCSlice!(const(int)), RCSlice!int));
     static assert( isCopyable!(RCSlice!(const(int)), RCSlice!(const(int))));
-    static assert( isCopyable!(RCSlice!(const(int)), RCSlice!(immutable(int))));
+    static assert(!isCopyable!(RCSlice!(const(int)), RCSlice!(immutable(int))));
     static assert( isCopyable!(RCSlice!(immutable(int)), RCSlice!(immutable(int))));
 
     static assert( isCopyable!(const(RCSlice!int), RCSlice!int));
     static assert( isCopyable!(const(RCSlice!int), const(RCSlice!int)));
     static assert( isCopyable!(const(RCSlice!int), immutable(RCSlice!int)));
 
-    static assert( isCopyable!(immutable(RCSlice!int), RCSlice!int));
-    static assert( isCopyable!(immutable(RCSlice!int), const(RCSlice!int)));
-    static assert( isCopyable!(immutable(RCSlice!int), immutable(RCSlice!int)));
+    static assert(!isCopyable!(immutable(RCSlice!int), RCSlice!int));
+    static assert(!isCopyable!(immutable(RCSlice!int), const(RCSlice!int)));
+    static assert(!isCopyable!(immutable(RCSlice!int), immutable(RCSlice!int)));
 
-    static assert( isCopyable!(const(RCSlice!(const(int))), RCSlice!int));
-    static assert( isCopyable!(const(RCSlice!(const(int))), const(RCSlice!int)));
+    static assert(!isCopyable!(const(RCSlice!(const(int))), RCSlice!int));
+    static assert(!isCopyable!(const(RCSlice!(const(int))), const(RCSlice!int)));
     static assert( isCopyable!(const(RCSlice!(const(int))), const(RCSlice!(const(int)))));
 
     static assert(!isCopyable!(RCSlice!int, const(RCSlice!(const(int)))));
@@ -1137,7 +1128,7 @@ version(none)
     static assert(!isCopyable!(const(RCSlice!(immutable(int))), RCSlice!int));
     static assert(!isCopyable!(immutable(RCSlice!(immutable(int))), RCSlice!(const(int))));
 
-    static assert( isCopyable!(immutable(RCSlice!(immutable(int))), RCSlice!(immutable(int))));
+    static assert(!isCopyable!(immutable(RCSlice!(immutable(int))), RCSlice!(immutable(int))));
 }
 
 //@betterC
@@ -1208,8 +1199,7 @@ version(none)
     void takeMutable(RCSlice!(const(int))) {}
     void takeConst(const RCSlice!(const(int))) {}
 
-    static if (EnableImplicitConvToConst)
-    {{
+    {
         RCSlice!int sm;
         const RCSlice!int sc;
         immutable RCSlice!int si;
@@ -1221,7 +1211,7 @@ version(none)
         static assert( is(typeof(() { takeConst(sm); })));
         static assert( is(typeof(() { takeConst(sc); })));
         static assert( is(typeof(() { takeConst(si); })));
-    }}
+    }
 
     {
         RCSlice!(const(int)) sm;
@@ -1324,11 +1314,11 @@ version(none)
     static RCSlice!(int*) glob;
     int local;
     int*[1] array = [&local];
-    RCSlice!(int*) s = array;
-
     // TODO: this currently fails. The ctor above should take
     // the array as return scope, but doing that brings the @nogc error
     // right back. Compiler should be smarter about scope arrays.
+
+    //RCSlice!(int*) s = array;
     //static assert(!isSafe({ glob = s; }));
 }
 
@@ -1359,8 +1349,6 @@ version(none)
     } (s);
 }
 
-// Segfault could be related to https://issues.dlang.org/show_bug.cgi?id=22593
-static if (EnableImplicitConvToConst)
 @safe @nogc pure nothrow unittest
 {
     static struct PB
@@ -1474,8 +1462,7 @@ long sum()(const RCSlice!(const(int)) input)
     RCSlice!int s = [1, 2, 3, 4];
     RCSlice!(const(int)) sc = s;
 
-    static if (EnableImplicitConvToConst)
-        assert(sum(s) == 10);
+    assert(sum(s) == 10);
     assert(sum(sc) == 10);
     assert(sum(RCSlice!(const(int))([1, 2, 3, 4])) == 10);
 }
@@ -1547,20 +1534,13 @@ long sum()(const RCSlice!(const(int)) input)
 @safe @nogc nothrow unittest
 {
     static RCSlice!(int*) ss;
-    // Funny thing, removing this `return` will make compiler
-    // silently allow the escape, and the static assert at the end
-    // will trigger
-    static auto create(return scope int*[] arr)
-    {
-        RCSlice!(int*) result = arr;
-        return result;
-    }
 
     int a, b, c;
     int*[3] pointers = [&a, &b, &c];
-    auto s1 = create(pointers);
-    auto s2 = s1 ~ create(pointers);
-    s1 ~= create(pointers);
+    static assert(!isSafe({ ss = pointers; }));
+    RCSlice!(int*) s1 = pointers;
+    auto s2 = s1 ~ pointers;
+    s1 ~= RCSlice!(int*)(pointers);
     assert(s1 == s2);
 
     assert(s1 !is s2);
