@@ -880,10 +880,10 @@ private:
     {
         auto ptr = cast(Descriptor*) alignedAlloc(size.numBytes, Descriptor.alignof);
         ptr || outOfMemoryError();
-        ptr.rc.rc = 0;
         static if (is(T == shared) || is(T == immutable))
         {
             ptr.rc.flags = 1;
+            ptr.rc.rc = 0;
             fudgeShared(&ptr.rc, 1);
         }
         else
@@ -1626,11 +1626,52 @@ size_t fetchChecked(CounterBlock* counter)
     return (counter.flags & 1) ? fetchShared(counter) : fetch(counter);
 }
 
+@system @nogc nothrow pure
+void* alignedAlloc(size_t size, size_t alignment)
+{
+    if (alignment < (void*).sizeof)
+        alignment = (void*).sizeof;
+    version (FreeStanding)
+    {
+        return _druntime_aligned_alloc(size, alignment);
+    }
+    else version (Windows)
+    {
+        return pure_aligned_malloc(size, alignment);
+    }
+    else version (Posix)
+    {
+        void* ptr;
+        if (auto result = posix_memalign(&ptr, alignment, size))
+            ptr = null;
+        return ptr;
+    }
+    else static assert(false, "alignedAlloc not implemented for this platform");
+}
+
+@system @nogc nothrow pure
+void alignedFree(void* ptr)
+{
+    version (FreeStanding)
+    {
+        return _druntime_aligned_free(ptr);
+    }
+    else version (Windows)
+    {
+        return _aligned_free(ptr);
+    }
+    else version (Posix)
+    {
+        import core.memory : pureFree;
+        pureFree(ptr);
+    }
+    else static assert(false, "alignedFree not implemented for this platform");
+}
+
 version (FreeStanding)   enum haveDRuntime = false;
 else version (D_BetterC) enum haveDRuntime = false;
 else                     enum haveDRuntime = true;
 
-// TODO: make alignedAlloc/alignedFree always have D linkage
 extern(C)
 {
     static if (haveDRuntime)
@@ -1660,10 +1701,6 @@ extern(C)
         }
     }
 
-    //
-    // alignedAlloc, alignedFree
-    //
-
     version (FreeStanding)
     {
         // I.e. freestanding callers would have to implement these two
@@ -1671,9 +1708,6 @@ extern(C)
         void* _druntime_aligned_alloc(size_t size, size_t alignment);
         @system @nogc nothrow pure
         void _druntime_free(void* ptr);
-
-        alias alignedAlloc = _druntime_aligned_alloc;
-        alias alignedFree = _druntime_free;
     }
     else version (Windows)
     {
@@ -1732,13 +1766,11 @@ extern(C)
             @system @nogc nothrow pure void _aligned_free(void*);
         }
 
-        alias alignedFree = _aligned_free;
-
         @system @nogc nothrow pure
-        pragma(mangle, "fakePureAlignedAlloc")
-        void* alignedAlloc(size_t size, size_t alignment);
+        pragma(mangle, "fakePure_aligned_malloc")
+        void* pure_aligned_malloc(size_t size, size_t alignment);
 
-        void* fakePureAlignedAlloc(size_t size, size_t alignment)
+        void* fakePure_aligned_malloc(size_t size, size_t alignment)
         {
             import core.stdc.errno;
             auto save = errno;
@@ -1750,15 +1782,5 @@ extern(C)
     {
         @system @nogc nothrow pure
         int posix_memalign(void** memptr, size_t alignment, size_t size);
-
-        @system @nogc nothrow pure
-        void* alignedAlloc(size_t size, size_t alignment)
-        {
-            void* ptr;
-            if (auto result = posix_memalign(&ptr, alignment < (void*).sizeof ? (void*).sizeof : alignment, size))
-                return null;
-            return ptr;
-        }
-        import core.memory : alignedFree = pureFree;
     }
 }
