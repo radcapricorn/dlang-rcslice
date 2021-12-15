@@ -1269,11 +1269,11 @@ do
 
         static assert(is(typeof(() { takeMutable(sm); })));
         static assert(is(typeof(() { takeMutable(sc); })));
-        //static assert(is(typeof(() { takeMutable(si); }))); // TODO: should!
+        static assert(is(typeof(() { takeMutable(si); })));
 
         static assert(is(typeof(() { takeConst(sm); })));
         static assert(is(typeof(() { takeConst(sc); })));
-        //static assert(is(typeof(() { takeConst(si); }))); // TODO: should!
+        static assert(is(typeof(() { takeConst(si); })));
     }
 }
 
@@ -1306,6 +1306,8 @@ do
     int*[1] array = [&local];
     static assert(!isSafe({ s = array; }));
     static assert(!isSafe({ s[0] = array[0]; }));
+    int* global;
+    static assert( isSafe({ s[0] = global; }));
 }
 
 //@betterC
@@ -1314,12 +1316,9 @@ do
     static RCSlice!(int*) glob;
     int local;
     int*[1] array = [&local];
-    // TODO: this currently fails. The ctor above should take
-    // the array as return scope, but doing that brings the @nogc error
-    // right back. Compiler should be smarter about scope arrays.
 
-    //RCSlice!(int*) s = array;
-    //static assert(!isSafe({ glob = s; }));
+    RCSlice!(int*) s = array;
+    static assert(!isSafe({ glob = s; }));
 }
 
 //@betterC
@@ -1365,7 +1364,7 @@ do
             // ...RCSlice could provide a @system public method to increase
             // refcount, although it'd be better if this nonsense
             // dichotomy ended before this century is done.
-            //assert(slice.refCount == 2);
+            assert(slice.refCount == 2);
         }
     }
 
